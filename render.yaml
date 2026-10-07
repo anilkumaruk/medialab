@@ -1,0 +1,22 @@
+# Render Blueprint - New > Blueprint > pick this repo.
+services:
+  - type: web
+    name: medialab
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/auth/config
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      # Demo mode: shows OTP codes on screen and demo logins on the login page.
+      # Set to "false" once SMTP/Twilio are configured.
+      - key: DEV_SHOW_OTP
+        value: "true"
+      - key: ALLOWED_EMAIL_DOMAINS
+        value: alliance.edu.in
+      - key: TIME_ZONE
+        value: Asia/Kolkata
