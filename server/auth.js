@@ -15,17 +15,17 @@ function readCookie(req, name) {
   return null;
 }
 
-function createSession(res, userId) {
+async function createSession(res, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
   const expires = new Date(Date.now() + config.sessionDays * 864e5);
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
-  db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(sha256(token), userId, now(), expires.toISOString());
+  await db.run('DELETE FROM sessions WHERE expires_at < ?', [now()]);
+  await db.run('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)', [sha256(token), userId, now(), expires.toISOString()]);
   res.cookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: config.isProd, expires, path: '/' });
 }
 
-function destroySession(req, res) {
+async function destroySession(req, res) {
   const token = readCookie(req, COOKIE);
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+  if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', [sha256(token)]);
   res.clearCookie(COOKIE, { path: '/' });
 }
 
@@ -45,12 +45,13 @@ function publicUser(u) {
   };
 }
 
-function loadUser(req, res, next) {
+async function loadUser(req, res, next) {
   const token = readCookie(req, COOKIE);
   if (token) {
-    const row = db
-      .prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1')
-      .get(sha256(token), now());
+    const row = await db.get(
+      'SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1',
+      [sha256(token), now()]
+    );
     if (row) req.user = publicUser(row);
   }
   next();

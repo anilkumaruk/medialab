@@ -8,17 +8,23 @@ const list = (v) => String(v || '').split(',').map((s) => s.trim().toLowerCase()
 module.exports = {
   isProd,
   port,
-  appUrl: (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`).replace(/\/$/, ''),
-  dataDir: process.env.DATA_DIR || path.join(__dirname, '..', 'data'),
+  appUrl: (
+    process.env.APP_URL ||
+    (process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`) ||
+    `http://localhost:${port}`
+  ).replace(/\/$/, ''),
+  // Supabase Postgres connection string (the Vercel Supabase integration sets POSTGRES_URL).
+  databaseUrl: process.env.DATABASE_URL || process.env.POSTGRES_URL || '',
+  cronSecret: process.env.CRON_SECRET || '',
   timeZone: process.env.TIME_ZONE || 'Asia/Kolkata',
 
   // Only these email domains (and their subdomains) may register. Empty = any domain.
   allowedDomains: list(process.env.ALLOWED_EMAIL_DOMAINS ?? 'alliance.edu.in'),
   defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || '+91',
 
-  // OTP codes are returned to the browser so you can test without SMTP/SMS: on by default in
-  // development, and in production only when DEV_SHOW_OTP=true (e.g. a team demo).
-  devShowOtp: process.env.DEV_SHOW_OTP === 'true' || (!isProd && process.env.DEV_SHOW_OTP !== 'false'),
+  // Demo mode: OTP codes are shown in the browser (and demo logins on the login page).
+  // On by default in development, or in production until SMTP is configured; DEV_SHOW_OTP overrides.
+  devShowOtp: process.env.DEV_SHOW_OTP ? process.env.DEV_SHOW_OTP === 'true' : !isProd || !process.env.SMTP_HOST,
 
   sessionDays: Number(process.env.SESSION_DAYS) || 7,
   maxRequestDays: Number(process.env.MAX_REQUEST_DAYS) || 14,

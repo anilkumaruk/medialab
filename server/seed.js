@@ -1,14 +1,6 @@
 // Seeds approvers, a demo student and the starting inventory on first run.
-// `npm run reset` wipes the database and seeds again.
-const fs = require('fs');
-const path = require('path');
+// `npm run reset` drops every table and seeds again.
 const config = require('./config');
-
-if (require.main === module && process.argv.includes('--reset')) {
-  for (const f of ['medialab.db', 'medialab.db-wal', 'medialab.db-shm']) fs.rmSync(path.join(config.dataDir, f), { force: true });
-  console.log('Database deleted.');
-}
-
 const bcrypt = require('bcryptjs');
 const { db, now } = require('./db');
 
@@ -54,33 +46,33 @@ const EQUIPMENT = [
   ['Rode NTG4+ Shotgun', 'Audio', 'Shotgun mic', 'AUD-012', 2, 0],
 ];
 
-function seed() {
+async function seed(tx) {
   const t = now();
-  db.transaction(() => {
-    const insUser = db.prepare(
-      `INSERT INTO users (name, email, phone, profession, batch, department, school, password_hash, role, approval_level,
-         email_verified, phone_verified, terms_accepted_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`
-    );
-    const adminHash = bcrypt.hashSync(config.seedPasswords.admin, 10);
-    ADMINS.forEach((a, i) => insUser.run(a.name, a.email, `+9190000000${i + 1}`, 'faculty', null, 'Media Lab', 'Media Studies', adminHash, 'admin', a.level, t, t));
-    insUser.run('Anil Kumar', `anil.kumar@${domain}`, '+919800000010', 'student', '2024-2028', 'CSE', 'Advanced Computing',
-      bcrypt.hashSync(config.seedPasswords.user, 10), 'user', 0, t, t);
+  const adminHash = await bcrypt.hash(config.seedPasswords.admin, 10);
+  const userHash = await bcrypt.hash(config.seedPasswords.user, 10);
+  const insUser = `INSERT INTO users (name, email, phone, profession, batch, department, school, password_hash, role, approval_level,
+       email_verified, phone_verified, terms_accepted_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`;
+  for (const [i, a] of ADMINS.entries()) {
+    await tx.run(insUser, [a.name, a.email, `+9190000000${i + 1}`, 'faculty', null, 'Media Lab', 'Media Studies', adminHash, 'admin', a.level, t, t]);
+  }
+  await tx.run(insUser, ['Anil Kumar', `anil.kumar@${domain}`, '+919800000010', 'student', '2024-2028', 'CSE', 'Advanced Computing', userHash, 'user', 0, t, t]);
 
-    const ids = {};
-    const insEq = db.prepare('INSERT INTO equipment (name, category, subtype, code, is_accessory, created_at) VALUES (?, ?, ?, ?, ?, ?)');
-    const insUnit = db.prepare('INSERT INTO units (equipment_id, barcode, status, notes, created_at) VALUES (?, ?, ?, ?, ?)');
-    for (const [name, category, subtype, code, count, isAcc, , maint = 0] of EQUIPMENT) {
-      const id = Number(insEq.run(name, category, subtype, code, isAcc, t).lastInsertRowid);
-      ids[code] = id;
-      for (let i = 1; i <= count; i++) {
-        const inMaint = i <= maint;
-        insUnit.run(id, `${code}-${String(i).padStart(2, '0')}`, inMaint ? 'maintenance' : 'available', inMaint ? 'Aperture ring sticking - sent for service' : '', t);
-      }
-    }
-    const link = db.prepare('INSERT INTO accessory_links (equipment_id, accessory_id) VALUES (?, ?)');
-    for (const [, , , code, , , acc = []] of EQUIPMENT) for (const a of acc) link.run(ids[code], ids[a]);
-  })();
+  const ids = {};
+  for (const [name, category, subtype, code, count, isAcc, , maint = 0] of EQUIPMENT) {
+    const { id } = await tx.get('INSERT INTO equipment (name, category, subtype, code, is_accessory, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id', [name, category, subtype, code, isAcc, t]);
+    ids[code] = id;
+    const barcodes = Array.from({ length: count }, (_, i) => `${code}-${String(i + 1).padStart(2, '0')}`);
+    const statuses = barcodes.map((_, i) => (i < maint ? 'maintenance' : 'available'));
+    const notes = barcodes.map((_, i) => (i < maint ? 'Aperture ring sticking - sent for service' : ''));
+    await tx.run(
+      'INSERT INTO units (equipment_id, barcode, status, notes, created_at) SELECT ?, unnest(?::text[]), unnest(?::text[]), unnest(?::text[]), ?',
+      [id, barcodes, statuses, notes, t]
+    );
+  }
+  for (const [, , , code, , , acc = []] of EQUIPMENT) {
+    for (const a of acc) await tx.run('INSERT INTO accessory_links (equipment_id, accessory_id) VALUES (?, ?)', [ids[code], ids[a]]);
+  }
 
   console.log(`
   Seeded MediaLab database.
@@ -88,16 +80,33 @@ function seed() {
     Level 2 approver  : ${ADMINS.find((a) => a.level === 2).email}
     Admin password    : ${config.seedPasswords.admin}
     Demo student      : anil.kumar@${domain} / ${config.seedPasswords.user}
-  Change these passwords (or set SEED_* in .env before first run) for real use.
+  Change these passwords (or set SEED_* before first run) for real use.
 `);
 }
 
-function seedIfEmpty() {
-  if (db.prepare('SELECT COUNT(*) AS c FROM users').get().c > 0) return false;
-  seed();
-  return true;
+async function seedIfEmpty() {
+  return db.tx(async (tx) => {
+    await tx.raw('SELECT pg_advisory_xact_lock(724002)'); // only one instance seeds
+    const { c } = await tx.get('SELECT COUNT(*) AS c FROM users');
+    if (c > 0) return false;
+    await seed(tx);
+    return true;
+  });
 }
 
-if (require.main === module) seedIfEmpty();
+if (require.main === module) {
+  (async () => {
+    const { dropAll, ensureReady, pool } = require('./db');
+    if (process.argv.includes('--reset')) {
+      await dropAll();
+      console.log('All tables dropped.');
+    }
+    await ensureReady();
+    await pool.end();
+  })().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
 
 module.exports = { seedIfEmpty };

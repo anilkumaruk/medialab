@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "public",
+  "regions": ["bom1"],
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api" }],
+  "functions": { "api/index.js": { "maxDuration": 30, "includeFiles": "server/**" } },
+  "crons": [{ "path": "/api/cron/alerts", "schedule": "30 3 * * *" }]
+}

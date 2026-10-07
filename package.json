@@ -10,13 +10,13 @@
     "reset": "node server/seed.js --reset"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^12.11.1",
     "dotenv": "^18.0.6",
     "express": "^5.2.1",
-    "nodemailer": "^10.0.15"
+    "nodemailer": "^10.0.15",
+    "pg": "^8.23.1"
   }
 }

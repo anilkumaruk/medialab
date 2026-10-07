@@ -67,26 +67,27 @@ async function sendSms(to, text) {
 }
 
 // In-app notification + email. `link` is an in-app route such as /requests/12.
-function notifyUser(userId, { title, body = '', link = null, email = true }) {
-  db.prepare('INSERT INTO notifications (user_id, title, body, link, created_at) VALUES (?, ?, ?, ?, ?)').run(userId, title, body, link, now());
+async function notifyUser(userId, { title, body = '', link = null, email = true }) {
+  await db.run('INSERT INTO notifications (user_id, title, body, link, created_at) VALUES (?, ?, ?, ?, ?)', [userId, title, body, link, now()]);
   if (email) {
-    const u = db.prepare('SELECT email FROM users WHERE id = ?').get(userId);
-    if (u) sendEmail(u.email, title, body, link ? `${config.appUrl}/#${link}` : null);
+    const u = await db.get('SELECT email FROM users WHERE id = ?', [userId]);
+    if (u) await sendEmail(u.email, title, body, link ? `${config.appUrl}/#${link}` : null);
   }
 }
 
-function notifyAdmins({ level = null, ...msg }) {
+async function notifyAdmins({ level = null, ...msg }) {
   const rows = level
-    ? db.prepare("SELECT id FROM users WHERE role = 'admin' AND active = 1 AND approval_level = ?").all(level)
-    : db.prepare("SELECT id FROM users WHERE role = 'admin' AND active = 1").all();
-  for (const r of rows) notifyUser(r.id, msg);
+    ? await db.all("SELECT id FROM users WHERE role = 'admin' AND active = 1 AND approval_level = ?", [level])
+    : await db.all("SELECT id FROM users WHERE role = 'admin' AND active = 1");
+  for (const r of rows) await notifyUser(r.id, msg);
 }
 
-function addLog({ actorId = null, subjectUserId = null, requestId = null, equipment = '', action, approvedBy = '', status = '', details = '' }) {
-  db.prepare(
+async function addLog({ actorId = null, subjectUserId = null, requestId = null, equipment = '', action, approvedBy = '', status = '', details = '' }, runner = db) {
+  await runner.run(
     `INSERT INTO logs (at, actor_id, subject_user_id, request_id, equipment, action, approved_by, status, details)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(now(), actorId, subjectUserId, requestId, equipment, action, approvedBy, status, details);
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [now(), actorId, subjectUserId, requestId, equipment, action, approvedBy, status, details]
+  );
 }
 
 module.exports = { sendEmail, sendSms, notifyUser, notifyAdmins, addLog };

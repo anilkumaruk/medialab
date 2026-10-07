@@ -2,14 +2,18 @@
 
 One platform for equipment **Request → Approve (L1, L2) → Barcode Issue → Alert → Verify Return → Log**.
 
-## Run it
+## Run it locally
+
+1. Create a free project at [supabase.com](https://supabase.com) (region: Mumbai).
+2. Copy `.env.example` to `.env` and set `DATABASE_URL`. In Supabase, open **Connect → Transaction pooler** and copy that string.
+3. Start the app:
 
 ```bash
 npm install
-npm run dev        # http://localhost:3000  (auto-restarts on server changes)
+npm run dev        # http://localhost:3000
 ```
 
-On first start the database (`data/medialab.db`) is created and seeded:
+On first start, the tables are created in Supabase and seeded:
 
 | Role | Login | Password |
 |---|---|---|
@@ -17,9 +21,16 @@ On first start the database (`data/medialab.db`) is created and seeded:
 | Level 2 approver | pritha@alliance.edu.in | `Admin@1234` |
 | Demo student | anil.kumar@alliance.edu.in | `Student@1234` |
 
-`npm run reset` wipes the database and seeds again.
+`npm run reset` drops all tables and seeds again. **This deletes all data.**
 
-In development, OTP codes appear in a toast and in the server console, and emails are printed to the console. Add SMTP and Twilio settings in `.env` (see `.env.example`) to send them for real.
+## Deploy on Vercel
+
+1. In Vercel, click **Add New → Project** and import this GitHub repo. Leave the defaults: framework "Other", no build command.
+2. Under **Settings → Environment Variables**, add `DATABASE_URL` (the Supabase transaction-pooler string). Instead, you can connect Supabase under **Storage**, which sets `POSTGRES_URL` for you.
+3. Optionally add `CRON_SECRET` (any long random string) so the daily alert cron runs. Add SMTP and Twilio settings to send real emails and SMS.
+4. Redeploy. The first request creates the tables and seeds the demo data.
+
+While SMTP isn't configured, demo mode is on: OTP codes appear on screen. Overdue and due-soon alerts run whenever someone uses the app, and also once a day from Vercel Cron.
 
 ## Features
 
@@ -43,14 +54,8 @@ In development, OTP codes appear in a toast and in the server console, and email
 
 ## Stack
 
-Node.js + Express 5, SQLite (better-sqlite3), vanilla JS front end with no build step.
+Node.js + Express 5, Postgres (Supabase, via `pg`), and a vanilla JS front end with no build step. Hosted on Vercel.
 
-- `server/`: API (`routes/auth.js`, `routes/user.js`, `routes/admin.js`), schema (`db.js`), alerts job (`jobs.js`), seed data (`seed.js`)
-- `public/`: single-page app (`js/pages/*`), design system (`css/app.css`)
-
-## Deploying
-
-Set `NODE_ENV=production`, `APP_URL`, SMTP and Twilio, and new `SEED_*` passwords before first start. Serve it over HTTPS (session cookies are `Secure` in production) behind a proxy with `TRUST_PROXY=1`, and back up `data/medialab.db`.
-
-> Tip: this folder is inside iCloud Drive. iCloud can slow down or corrupt `node_modules` and the live SQLite file. For real use, keep the project outside iCloud, or set `DATA_DIR` to a local path.
-# medialab
+- `server/app.js`: the Express app. `server/index.js` runs it locally; `api/index.js` runs it as the Vercel function.
+- `server/`: API routes (`routes/auth.js`, `routes/user.js`, `routes/admin.js`), schema (`db.js`), alerts (`jobs.js`), seed data (`seed.js`)
+- `public/`: single-page app (`js/pages/*`) and design system (`css/app.css`), served by Vercel's CDN

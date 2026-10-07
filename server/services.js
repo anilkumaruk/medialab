@@ -37,7 +37,7 @@ function fmtEquipment(e) {
   };
 }
 
-function listEquipment({ category = null, q = null, userId = 0, includeInactive = false } = {}) {
+async function listEquipment({ category = null, q = null, userId = 0, includeInactive = false } = {}) {
   const where = [];
   const params = [userId];
   if (!includeInactive) where.push('e.active = 1');
@@ -46,43 +46,42 @@ function listEquipment({ category = null, q = null, userId = 0, includeInactive 
     params.push(category);
   }
   if (q) {
-    where.push('(e.name LIKE ? OR e.code LIKE ? OR e.subtype LIKE ? OR e.category LIKE ?)');
+    where.push('(e.name ILIKE ? OR e.code ILIKE ? OR e.subtype ILIKE ? OR e.category ILIKE ?)');
     const like = `%${q}%`;
     params.push(like, like, like, like);
   }
   const sql = `SELECT e.*, ${COUNT_COLS}, ${NOTIFYING_COL} FROM equipment e
-    ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.is_accessory, e.name COLLATE NOCASE`;
-  return db.prepare(sql).all(...params).map(fmtEquipment);
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.is_accessory, lower(e.name)`;
+  return (await db.all(sql, params)).map(fmtEquipment);
 }
 
-function getEquipment(id, userId = 0) {
-  const row = db.prepare(`SELECT e.*, ${COUNT_COLS}, ${NOTIFYING_COL} FROM equipment e WHERE e.id = ?`).get(userId, id);
+async function getEquipment(id, userId = 0) {
+  const row = await db.get(`SELECT e.*, ${COUNT_COLS}, ${NOTIFYING_COL} FROM equipment e WHERE e.id = ?`, [userId, id]);
   return row ? fmtEquipment(row) : null;
 }
 
-function accessoriesOf(id, userId = 0) {
-  return db
-    .prepare(
-      `SELECT e.*, ${COUNT_COLS}, ${NOTIFYING_COL} FROM accessory_links a JOIN equipment e ON e.id = a.accessory_id
-       WHERE a.equipment_id = ? AND e.active = 1 ORDER BY e.name`
-    )
-    .all(userId, id)
-    .map(fmtEquipment);
+async function accessoriesOf(id, userId = 0) {
+  const rows = await db.all(
+    `SELECT e.*, ${COUNT_COLS}, ${NOTIFYING_COL} FROM accessory_links a JOIN equipment e ON e.id = a.accessory_id
+     WHERE a.equipment_id = ? AND e.active = 1 ORDER BY e.name`,
+    [userId, id]
+  );
+  return rows.map(fmtEquipment);
 }
 
 // Tell users who asked "Notify when available" once stock is back.
-function processNotifyRequests(equipmentIds) {
+async function processNotifyRequests(equipmentIds) {
   for (const id of new Set(equipmentIds)) {
-    const e = getEquipment(id);
+    const e = await getEquipment(id);
     if (!e || e.available < 1) continue;
-    const subs = db.prepare('SELECT * FROM notify_requests WHERE equipment_id = ? AND notified_at IS NULL').all(id);
+    const subs = await db.all('SELECT * FROM notify_requests WHERE equipment_id = ? AND notified_at IS NULL', [id]);
     for (const s of subs) {
-      notifyUser(s.user_id, {
+      await notifyUser(s.user_id, {
         title: `${e.name} is available again`,
         body: `${e.available} of ${e.total} ${e.name} are now available at the Media Lab. Request it before it's taken.`,
         link: `/inventory/${e.category}`,
       });
-      db.prepare('UPDATE notify_requests SET notified_at = ? WHERE id = ?').run(now(), s.id);
+      await db.run('UPDATE notify_requests SET notified_at = ? WHERE id = ?', [now(), s.id]);
     }
   }
 }
@@ -107,16 +106,15 @@ function summarize(items) {
   return [...counts].map(([name, n]) => (n > 1 ? `${name} x${n}` : name));
 }
 
-function hydrate(rows) {
+async function hydrate(rows) {
   if (!rows.length) return [];
   const ids = rows.map((r) => r.id);
-  const items = db
-    .prepare(
-      `SELECT ri.*, e.name, e.code, e.category, e.is_accessory, un.barcode
-       FROM request_items ri JOIN equipment e ON e.id = ri.equipment_id LEFT JOIN units un ON un.id = ri.unit_id
-       WHERE ri.request_id IN (${ids.map(() => '?').join(',')}) ORDER BY e.is_accessory, ri.id`
-    )
-    .all(...ids);
+  const items = await db.all(
+    `SELECT ri.*, e.name, e.code, e.category, e.is_accessory, un.barcode
+     FROM request_items ri JOIN equipment e ON e.id = ri.equipment_id LEFT JOIN units un ON un.id = ri.unit_id
+     WHERE ri.request_id = ANY(?) ORDER BY e.is_accessory, ri.id`,
+    [ids]
+  );
   const byReq = new Map();
   for (const it of items) {
     if (!byReq.has(it.request_id)) byReq.set(it.request_id, []);
@@ -176,19 +174,17 @@ function hydrate(rows) {
   });
 }
 
-function listRequests(where = '1=1', params = [], order = 'r.id DESC', limit = 500) {
-  return hydrate(db.prepare(`${REQUEST_BASE} WHERE (${where}) ORDER BY ${order} LIMIT ${Number(limit)}`).all(...params));
+async function listRequests(where = '1=1', params = [], order = 'r.id DESC', limit = 500) {
+  return hydrate(await db.all(`${REQUEST_BASE} WHERE (${where}) ORDER BY ${order} LIMIT ${Number(limit)}`, params));
 }
 
-function getRequest(id) {
-  return listRequests('r.id = ?', [id])[0] || null;
+async function getRequest(id) {
+  return (await listRequests('r.id = ?', [id]))[0] || null;
 }
 
-function approverNames(level) {
-  return db
-    .prepare("SELECT name FROM users WHERE role = 'admin' AND active = 1 AND approval_level = ? ORDER BY name")
-    .all(level)
-    .map((r) => r.name);
+async function approverNames(level) {
+  const rows = await db.all("SELECT name FROM users WHERE role = 'admin' AND active = 1 AND approval_level = ? ORDER BY name", [level]);
+  return rows.map((r) => r.name);
 }
 
 function requestDetailsText(r) {

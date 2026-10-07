@@ -4,51 +4,52 @@ const { db, now } = require('../db');
 const { fail, str, parseDate, intId, fmtDateTime } = require('../util');
 const { requireAuth } = require('../auth');
 const { notifyAdmins, addLog } = require('../notify');
+const { maybeRunAlerts } = require('../jobs');
 const S = require('../services');
 
 const router = express.Router();
 router.use(requireAuth);
 
-router.get('/approvers', (req, res) => {
-  res.json({ l1: S.approverNames(1), l2: S.approverNames(2) });
+router.get('/approvers', async (req, res) => {
+  res.json({ l1: await S.approverNames(1), l2: await S.approverNames(2) });
 });
 
 // ---------------- Inventory ----------------
 
-router.get('/equipment', (req, res) => {
+router.get('/equipment', async (req, res) => {
   const category = S.CATEGORIES.includes(req.query.category) ? req.query.category : null;
-  res.json({ equipment: S.listEquipment({ category, q: str(req.query.q, 80) || null, userId: req.user.id }) });
+  res.json({ equipment: await S.listEquipment({ category, q: str(req.query.q, 80) || null, userId: req.user.id }) });
 });
 
-router.get('/equipment/:id', (req, res) => {
-  const e = S.getEquipment(intId(req.params.id), req.user.id);
+router.get('/equipment/:id', async (req, res) => {
+  const e = await S.getEquipment(intId(req.params.id), req.user.id);
   if (!e || !e.active) fail(404, 'Equipment not found');
-  res.json({ equipment: e, accessories: S.accessoriesOf(e.id, req.user.id) });
+  res.json({ equipment: e, accessories: await S.accessoriesOf(e.id, req.user.id) });
 });
 
-router.post('/equipment/:id/notify', (req, res) => {
-  const e = S.getEquipment(intId(req.params.id));
+router.post('/equipment/:id/notify', async (req, res) => {
+  const e = await S.getEquipment(intId(req.params.id));
   if (!e) fail(404, 'Equipment not found');
-  const exists = db.prepare('SELECT 1 FROM notify_requests WHERE user_id = ? AND equipment_id = ? AND notified_at IS NULL').get(req.user.id, e.id);
-  if (!exists) db.prepare('INSERT INTO notify_requests (user_id, equipment_id, created_at) VALUES (?, ?, ?)').run(req.user.id, e.id, now());
+  const exists = await db.get('SELECT 1 FROM notify_requests WHERE user_id = ? AND equipment_id = ? AND notified_at IS NULL', [req.user.id, e.id]);
+  if (!exists) await db.run('INSERT INTO notify_requests (user_id, equipment_id, created_at) VALUES (?, ?, ?)', [req.user.id, e.id, now()]);
   res.json({ ok: true });
 });
 
-router.delete('/equipment/:id/notify', (req, res) => {
-  db.prepare('DELETE FROM notify_requests WHERE user_id = ? AND equipment_id = ? AND notified_at IS NULL').run(req.user.id, intId(req.params.id));
+router.delete('/equipment/:id/notify', async (req, res) => {
+  await db.run('DELETE FROM notify_requests WHERE user_id = ? AND equipment_id = ? AND notified_at IS NULL', [req.user.id, intId(req.params.id)]);
   res.json({ ok: true });
 });
 
 // ---------------- Requests ----------------
 
-function ownRequest(req) {
-  const r = S.getRequest(intId(req.params.id));
+async function ownRequest(req) {
+  const r = await S.getRequest(intId(req.params.id));
   if (!r || (r.user.id !== req.user.id && req.user.role !== 'admin')) fail(404, 'Request not found');
   return r;
 }
 
-router.get('/requests/mine', (req, res) => {
-  const requests = S.listRequests('r.user_id = ?', [req.user.id]);
+router.get('/requests/mine', async (req, res) => {
+  const requests = await S.listRequests('r.user_id = ?', [req.user.id]);
   const by = (...st) => requests.filter((r) => st.includes(r.status)).length;
   res.json({
     requests,
@@ -62,10 +63,10 @@ router.get('/requests/mine', (req, res) => {
   });
 });
 
-router.get('/requests/:id', (req, res) => res.json({ request: ownRequest(req) }));
+router.get('/requests/:id', async (req, res) => res.json({ request: await ownRequest(req) }));
 
 // Create or update a draft; with submit=true it goes to Level 1 approval.
-router.post('/requests', (req, res) => {
+router.post('/requests', async (req, res) => {
   const b = req.body;
   const submit = b.submit === true;
 
@@ -79,11 +80,12 @@ router.post('/requests', (req, res) => {
   if (!qtyBy.size) fail(400, 'Add at least one item to your request');
   if ([...qtyBy.values()].reduce((a, n) => a + n, 0) > 20) fail(400, 'A request can include at most 20 items');
 
-  const equipment = [...qtyBy.keys()].map((id) => {
-    const e = S.getEquipment(id);
+  const equipment = [];
+  for (const id of qtyBy.keys()) {
+    const e = await S.getEquipment(id);
     if (!e || !e.active) fail(400, 'Some selected equipment is no longer offered');
-    return e;
-  });
+    equipment.push(e);
+  }
 
   const from = parseDate(b.fromAt);
   const to = parseDate(b.toAt);
@@ -104,37 +106,40 @@ router.post('/requests', (req, res) => {
 
   let existing = null;
   if (b.id) {
-    existing = db.prepare('SELECT * FROM requests WHERE id = ?').get(intId(b.id));
+    existing = await db.get('SELECT * FROM requests WHERE id = ?', [intId(b.id)]);
     if (!existing || existing.user_id !== req.user.id) fail(404, 'Request not found');
     if (existing.status !== 'draft') fail(409, 'Only drafts can be edited');
   }
 
   const t = now();
-  const id = db.transaction(() => {
+  const fromIso = from?.toISOString() ?? null;
+  const toIso = to?.toISOString() ?? null;
+  const id = await db.tx(async (tx) => {
     let rid;
     if (existing) {
       rid = existing.id;
-      db.prepare('UPDATE requests SET from_at = ?, to_at = ?, purpose = ?, updated_at = ? WHERE id = ?').run(
-        from?.toISOString() ?? null, to?.toISOString() ?? null, purpose, t, rid
-      );
-      db.prepare('DELETE FROM request_items WHERE request_id = ?').run(rid);
+      await tx.run('UPDATE requests SET from_at = ?, to_at = ?, purpose = ?, updated_at = ? WHERE id = ?', [fromIso, toIso, purpose, t, rid]);
+      await tx.run('DELETE FROM request_items WHERE request_id = ?', [rid]);
     } else {
-      rid = Number(
-        db.prepare("INSERT INTO requests (user_id, from_at, to_at, purpose, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'draft', ?, ?)")
-          .run(req.user.id, from?.toISOString() ?? null, to?.toISOString() ?? null, purpose, t, t).lastInsertRowid
-      );
-      db.prepare('UPDATE requests SET code = ? WHERE id = ?').run(`REQ-${1000 + rid}`, rid);
+      rid = (
+        await tx.get(
+          "INSERT INTO requests (user_id, from_at, to_at, purpose, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'draft', ?, ?) RETURNING id",
+          [req.user.id, fromIso, toIso, purpose, t, t]
+        )
+      ).id;
+      await tx.run('UPDATE requests SET code = ? WHERE id = ?', [`REQ-${1000 + rid}`, rid]);
     }
-    const ins = db.prepare('INSERT INTO request_items (request_id, equipment_id) VALUES (?, ?)');
-    for (const [eid, q] of qtyBy) for (let i = 0; i < q; i++) ins.run(rid, eid);
-    if (submit) db.prepare("UPDATE requests SET status = 'pending_l1', submitted_at = ? WHERE id = ?").run(t, rid);
+    const eqIds = [];
+    for (const [eid, q] of qtyBy) for (let i = 0; i < q; i++) eqIds.push(eid);
+    await tx.run('INSERT INTO request_items (request_id, equipment_id) SELECT ?, unnest(?::int[])', [rid, eqIds]);
+    if (submit) await tx.run("UPDATE requests SET status = 'pending_l1', submitted_at = ? WHERE id = ?", [t, rid]);
     return rid;
-  })();
+  });
 
-  const r = S.getRequest(id);
+  const r = await S.getRequest(id);
   if (submit) {
-    addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: id, equipment: r.equipmentList.join(', '), action: 'Requested', status: 'PENDING L1' });
-    notifyAdmins({
+    await addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: id, equipment: r.equipmentList.join(', '), action: 'Requested', status: 'PENDING L1' });
+    await notifyAdmins({
       level: 1,
       title: `New equipment request ${r.code} from ${r.user.name}`,
       body: `${S.requestDetailsText(r)}\n\nPlease accept or reject this request (remarks are compulsory at Level 1).`,
@@ -144,26 +149,26 @@ router.post('/requests', (req, res) => {
   res.status(existing ? 200 : 201).json({ request: r });
 });
 
-router.post('/requests/:id/cancel', (req, res) => {
-  const r = ownRequest(req);
+router.post('/requests/:id/cancel', async (req, res) => {
+  const r = await ownRequest(req);
   if (r.user.id !== req.user.id) fail(403, 'You can only cancel your own requests');
   if (!['draft', 'pending_l1', 'pending_l2', 'approved'].includes(r.status)) fail(409, 'This request can no longer be cancelled');
-  db.prepare("UPDATE requests SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?").run(now(), now(), r.id);
+  await db.run("UPDATE requests SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?", [now(), now(), r.id]);
   if (r.status !== 'draft') {
-    addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Cancelled by requester', status: 'CANCELLED' });
+    await addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Cancelled by requester', status: 'CANCELLED' });
   }
-  res.json({ request: S.getRequest(r.id) });
+  res.json({ request: await S.getRequest(r.id) });
 });
 
-router.delete('/requests/:id', (req, res) => {
-  const r = ownRequest(req);
+router.delete('/requests/:id', async (req, res) => {
+  const r = await ownRequest(req);
   if (r.user.id !== req.user.id || r.status !== 'draft') fail(409, 'Only your drafts can be deleted');
-  db.prepare('DELETE FROM requests WHERE id = ?').run(r.id);
+  await db.run('DELETE FROM requests WHERE id = ?', [r.id]);
   res.json({ ok: true });
 });
 
-router.post('/requests/:id/renew', (req, res) => {
-  const r = ownRequest(req);
+router.post('/requests/:id/renew', async (req, res) => {
+  const r = await ownRequest(req);
   if (r.user.id !== req.user.id) fail(403, 'You can only renew your own requests');
   if (r.status !== 'issued') fail(409, 'Only equipment currently with you can be renewed');
   if (r.renewal?.status === 'pending') fail(409, 'A renewal is already awaiting approval');
@@ -172,36 +177,39 @@ router.post('/requests/:id/renew', (req, res) => {
   if (!renewTo || renewTo.toISOString() <= r.toAt) fail(400, 'Choose a new return time after the current due time', { field: 'renewTo' });
   if (renewTo - new Date(r.fromAt) > config.maxRequestDays * 2 * 864e5) fail(400, 'That extension is too long. Return the kit and submit a new request.');
   if (reason.length < 3) fail(400, 'Give a reason for the renewal', { field: 'reason' });
-  db.prepare("UPDATE requests SET renew_to = ?, renew_reason = ?, renew_status = 'pending', renew_by = NULL, renew_at = NULL, renew_remarks = NULL, updated_at = ? WHERE id = ?")
-    .run(renewTo.toISOString(), reason, now(), r.id);
-  addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Renewal requested', status: 'IN USE', details: `Until ${fmtDateTime(renewTo.toISOString())}` });
-  notifyAdmins({
+  await db.run(
+    "UPDATE requests SET renew_to = ?, renew_reason = ?, renew_status = 'pending', renew_by = NULL, renew_at = NULL, renew_remarks = NULL, updated_at = ? WHERE id = ?",
+    [renewTo.toISOString(), reason, now(), r.id]
+  );
+  await addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Renewal requested', status: 'IN USE', details: `Until ${fmtDateTime(renewTo.toISOString())}` });
+  await notifyAdmins({
     level: 1,
     title: `Renewal request for ${r.code}`,
     body: `${r.user.name} asked to keep ${r.equipmentList.join(', ')} until ${fmtDateTime(renewTo.toISOString())}.\nReason: ${reason}`,
     link: `/admin/approvals/${r.id}`,
   });
-  res.json({ request: S.getRequest(r.id) });
+  res.json({ request: await S.getRequest(r.id) });
 });
 
-router.post('/requests/:id/dismiss', (req, res) => {
-  const r = ownRequest(req);
-  if (r.status === 'issued') db.prepare('UPDATE requests SET alert_dismissed_at = ? WHERE id = ?').run(now(), r.id);
-  else if (r.status === 'returned') db.prepare('UPDATE requests SET return_ack_at = ? WHERE id = ?').run(now(), r.id);
+router.post('/requests/:id/dismiss', async (req, res) => {
+  const r = await ownRequest(req);
+  if (r.status === 'issued') await db.run('UPDATE requests SET alert_dismissed_at = ? WHERE id = ?', [now(), r.id]);
+  else if (r.status === 'returned') await db.run('UPDATE requests SET return_ack_at = ? WHERE id = ?', [now(), r.id]);
   res.json({ ok: true });
 });
 
 // Duration alerts: due within N hours (or overdue) and recently verified returns.
-router.get('/alerts', (req, res) => {
+router.get('/alerts', async (req, res) => {
+  await maybeRunAlerts();
   const t = now();
   const soon = new Date(Date.now() + config.dueSoonHours * 3600e3).toISOString();
-  const due = S.listRequests(
+  const due = await S.listRequests(
     `r.user_id = ? AND r.status = 'issued' AND r.to_at <= ?
      AND (r.alert_dismissed_at IS NULL OR (r.to_at < ? AND r.alert_dismissed_at < r.to_at))`,
     [req.user.id, soon, t],
     'r.to_at ASC'
   );
-  const returned = S.listRequests(
+  const returned = await S.listRequests(
     "r.user_id = ? AND r.status = 'returned' AND r.return_ack_at IS NULL AND r.returned_at > ?",
     [req.user.id, new Date(Date.now() - 3 * 864e5).toISOString()],
     'r.returned_at DESC',
@@ -212,17 +220,18 @@ router.get('/alerts', (req, res) => {
 
 // ---------------- Notifications ----------------
 
-router.get('/notifications', (req, res) => {
-  const items = db.prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30').all(req.user.id);
-  const unread = db.prepare('SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND read_at IS NULL').get(req.user.id).c;
+router.get('/notifications', async (req, res) => {
+  await maybeRunAlerts();
+  const items = await db.all('SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30', [req.user.id]);
+  const { c: unread } = await db.get('SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND read_at IS NULL', [req.user.id]);
   res.json({
     unread,
     notifications: items.map((n) => ({ id: n.id, title: n.title, body: n.body, link: n.link, read: !!n.read_at, createdAt: n.created_at })),
   });
 });
 
-router.post('/notifications/read', (req, res) => {
-  db.prepare('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL').run(now(), req.user.id);
+router.post('/notifications/read', async (req, res) => {
+  await db.run('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL', [now(), req.user.id]);
   res.json({ ok: true });
 });
 

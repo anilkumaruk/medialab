@@ -3,6 +3,7 @@ const { db, now } = require('../db');
 const { fail, str, parseDate, intId, fmtDateTime } = require('../util');
 const { requireAdmin } = require('../auth');
 const { notifyUser, notifyAdmins, addLog } = require('../notify');
+const { maybeRunAlerts } = require('../jobs');
 const S = require('../services');
 
 const router = express.Router();
@@ -12,8 +13,8 @@ const requireLevel2 = (req) => {
   if (req.user.approvalLevel !== 2) fail(403, 'Only Level 2 admins can manage users');
 };
 
-function loadRequest(id) {
-  const r = S.getRequest(intId(id));
+async function loadRequest(id) {
+  const r = await S.getRequest(intId(id));
   if (!r) fail(404, 'Request not found');
   return r;
 }
@@ -22,48 +23,60 @@ const approvedBy = (r) => [r.l1?.by, r.l2?.by].filter(Boolean).join(' / ');
 
 // ---------------- Dashboard ----------------
 
-router.get('/dashboard', (req, res) => {
-  const units = db.prepare(
+router.get('/dashboard', async (req, res) => {
+  await maybeRunAlerts();
+  const units = await db.get(
     `SELECT COUNT(*) AS total,
-       SUM(status = 'available') AS available, SUM(status = 'in_use') AS inUse, SUM(status = 'maintenance') AS maintenance
+       COUNT(*) FILTER (WHERE status = 'available') AS available,
+       COUNT(*) FILTER (WHERE status = 'in_use') AS in_use,
+       COUNT(*) FILTER (WHERE status = 'maintenance') AS maintenance
      FROM units WHERE status <> 'retired'`
-  ).get();
+  );
   const t = now();
-  const c = (sql, ...p) => db.prepare(sql).get(...p).c;
+  const c = await db.get(
+    `SELECT
+       COUNT(*) FILTER (WHERE status = 'pending_l1') AS pending_l1,
+       COUNT(*) FILTER (WHERE status = 'pending_l2') AS pending_l2,
+       COUNT(*) FILTER (WHERE status = 'approved') AS to_issue,
+       COUNT(*) FILTER (WHERE status = 'issued') AS issued,
+       COUNT(*) FILTER (WHERE status = 'issued' AND to_at < ?) AS overdue,
+       COUNT(*) FILTER (WHERE renew_status = 'pending') AS renewals
+     FROM requests`,
+    [t]
+  );
+  const { c: userCount } = await db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'user'");
+  const recent = await db.all(
+    `SELECT l.*, su.name AS user_name, rq.code AS request_code FROM logs l
+     LEFT JOIN users su ON su.id = l.subject_user_id LEFT JOIN requests rq ON rq.id = l.request_id
+     ORDER BY l.id DESC LIMIT 10`
+  );
   res.json({
-    units: { total: units.total || 0, available: units.available || 0, inUse: units.inUse || 0, maintenance: units.maintenance || 0 },
+    units: { total: units.total, available: units.available, inUse: units.in_use, maintenance: units.maintenance },
     counts: {
-      pendingL1: c("SELECT COUNT(*) AS c FROM requests WHERE status = 'pending_l1'"),
-      pendingL2: c("SELECT COUNT(*) AS c FROM requests WHERE status = 'pending_l2'"),
-      toIssue: c("SELECT COUNT(*) AS c FROM requests WHERE status = 'approved'"),
-      issued: c("SELECT COUNT(*) AS c FROM requests WHERE status = 'issued'"),
-      overdue: c("SELECT COUNT(*) AS c FROM requests WHERE status = 'issued' AND to_at < ?", t),
-      renewals: c("SELECT COUNT(*) AS c FROM requests WHERE renew_status = 'pending'"),
-      users: c("SELECT COUNT(*) AS c FROM users WHERE role = 'user'"),
+      pendingL1: c.pending_l1,
+      pendingL2: c.pending_l2,
+      toIssue: c.to_issue,
+      issued: c.issued,
+      overdue: c.overdue,
+      renewals: c.renewals,
+      users: userCount,
     },
-    overdue: S.listRequests("r.status = 'issued' AND r.to_at < ?", [t], 'r.to_at ASC', 20),
-    dueSoon: S.listRequests("r.status = 'issued' AND r.to_at >= ? AND r.to_at <= ?", [t, new Date(Date.now() + 864e5).toISOString()], 'r.to_at ASC', 20),
-    recent: db
-      .prepare(
-        `SELECT l.*, su.name AS user_name, rq.code AS request_code FROM logs l
-         LEFT JOIN users su ON su.id = l.subject_user_id LEFT JOIN requests rq ON rq.id = l.request_id
-         ORDER BY l.id DESC LIMIT 10`
-      )
-      .all()
-      .map(fmtLog),
+    overdue: await S.listRequests("r.status = 'issued' AND r.to_at < ?", [t], 'r.to_at ASC', 20),
+    dueSoon: await S.listRequests("r.status = 'issued' AND r.to_at >= ? AND r.to_at <= ?", [t, new Date(Date.now() + 864e5).toISOString()], 'r.to_at ASC', 20),
+    recent: recent.map(fmtLog),
   });
 });
 
 // ---------------- Approvals ----------------
 
-router.get('/approvals', (req, res) => {
+router.get('/approvals', async (req, res) => {
   res.json({
-    requests: S.listRequests("r.status IN ('pending_l1', 'pending_l2') OR r.renew_status = 'pending'", [], 'r.submitted_at ASC'),
+    requests: await S.listRequests("r.status IN ('pending_l1', 'pending_l2') OR r.renew_status = 'pending'", [], 'r.submitted_at ASC'),
   });
 });
 
-router.post('/requests/:id/decision', (req, res) => {
-  const r = loadRequest(req.params.id);
+router.post('/requests/:id/decision', async (req, res) => {
+  const r = await loadRequest(req.params.id);
   const accept = req.body.decision === 'accept';
   if (!accept && req.body.decision !== 'reject') fail(400, 'Choose accept or reject');
   const remarks = str(req.body.remarks, 500);
@@ -74,118 +87,127 @@ router.post('/requests/:id/decision', (req, res) => {
   if (r.status === 'pending_l1') {
     if (me.approvalLevel !== 1) fail(403, 'Only Level 1 approvers can act on this request');
     if (remarks.length < 2) fail(400, 'Remarks are compulsory at Level 1', { field: 'remarks' });
-    db.prepare(`UPDATE requests SET status = ?, l1_by = ?, l1_at = ?, l1_decision = ?, l1_remarks = ?, updated_at = ? WHERE id = ?`).run(
-      accept ? 'pending_l2' : 'rejected', me.id, t, accept ? 'accepted' : 'rejected', remarks, t, r.id
+    const done = await db.run(
+      "UPDATE requests SET status = ?, l1_by = ?, l1_at = ?, l1_decision = ?, l1_remarks = ?, updated_at = ? WHERE id = ? AND status = 'pending_l1'",
+      [accept ? 'pending_l2' : 'rejected', me.id, t, accept ? 'accepted' : 'rejected', remarks, t, r.id]
     );
-    addLog({ actorId: me.id, subjectUserId: r.user.id, requestId: r.id, equipment, action: accept ? 'L1 accepted' : 'L1 rejected', approvedBy: me.name, status: accept ? 'PENDING L2' : 'REJECTED', details: remarks });
-    const updated = S.getRequest(r.id);
+    if (!done.changes) fail(409, 'Another approver already decided this request');
+    await addLog({ actorId: me.id, subjectUserId: r.user.id, requestId: r.id, equipment, action: accept ? 'L1 accepted' : 'L1 rejected', approvedBy: me.name, status: accept ? 'PENDING L2' : 'REJECTED', details: remarks });
+    const updated = await S.getRequest(r.id);
     if (accept) {
-      notifyUser(r.user.id, { title: `${r.code} accepted at Level 1`, body: `${me.name}: ${remarks}\nYour request now awaits final (Level 2) approval.`, link: `/requests/${r.id}` });
-      notifyAdmins({ level: 2, title: `${r.code} awaits your final approval`, body: `${S.requestDetailsText(updated)}\n\nLevel 1 (${me.name}): ${remarks}`, link: `/admin/approvals/${r.id}` });
+      await notifyUser(r.user.id, { title: `${r.code} accepted at Level 1`, body: `${me.name}: ${remarks}\nYour request now awaits final (Level 2) approval.`, link: `/requests/${r.id}` });
+      await notifyAdmins({ level: 2, title: `${r.code} awaits your final approval`, body: `${S.requestDetailsText(updated)}\n\nLevel 1 (${me.name}): ${remarks}`, link: `/admin/approvals/${r.id}` });
     } else {
-      notifyUser(r.user.id, { title: `${r.code} was rejected`, body: `Rejected at Level 1 by ${me.name}.\nRemarks: ${remarks}`, link: `/requests/${r.id}` });
+      await notifyUser(r.user.id, { title: `${r.code} was rejected`, body: `Rejected at Level 1 by ${me.name}.\nRemarks: ${remarks}`, link: `/requests/${r.id}` });
     }
     return res.json({ request: updated });
   }
 
   if (r.status === 'pending_l2') {
     if (me.approvalLevel !== 2) fail(403, 'Only the Level 2 approver can give final approval');
-    db.prepare(`UPDATE requests SET status = ?, l2_by = ?, l2_at = ?, l2_decision = ?, l2_remarks = ?, updated_at = ? WHERE id = ?`).run(
-      accept ? 'approved' : 'rejected', me.id, t, accept ? 'accepted' : 'rejected', remarks || null, t, r.id
+    const done = await db.run(
+      "UPDATE requests SET status = ?, l2_by = ?, l2_at = ?, l2_decision = ?, l2_remarks = ?, updated_at = ? WHERE id = ? AND status = 'pending_l2'",
+      [accept ? 'approved' : 'rejected', me.id, t, accept ? 'accepted' : 'rejected', remarks || null, t, r.id]
     );
-    addLog({ actorId: me.id, subjectUserId: r.user.id, requestId: r.id, equipment, action: accept ? 'L2 approved' : 'L2 rejected', approvedBy: [r.l1?.by, me.name].filter(Boolean).join(' / '), status: accept ? 'APPROVED' : 'REJECTED', details: remarks });
-    notifyUser(r.user.id, accept
+    if (!done.changes) fail(409, 'This request was already decided');
+    await addLog({ actorId: me.id, subjectUserId: r.user.id, requestId: r.id, equipment, action: accept ? 'L2 approved' : 'L2 rejected', approvedBy: [r.l1?.by, me.name].filter(Boolean).join(' / '), status: accept ? 'APPROVED' : 'REJECTED', details: remarks });
+    await notifyUser(r.user.id, accept
       ? { title: `${r.code} approved - collect from the Media Lab`, body: `Final approval by ${me.name}.${remarks ? `\nRemarks: ${remarks}` : ''}\nPickup from ${fmtDateTime(r.fromAt)}. Barcodes are scanned at issue. Handle with care - damage may result in a fine.`, link: `/requests/${r.id}` }
       : { title: `${r.code} was rejected`, body: `Rejected at Level 2 by ${me.name}.${remarks ? `\nRemarks: ${remarks}` : ''}`, link: `/requests/${r.id}` });
-    return res.json({ request: S.getRequest(r.id) });
+    return res.json({ request: await S.getRequest(r.id) });
   }
 
   fail(409, 'This request is no longer awaiting approval');
 });
 
-router.post('/requests/:id/renewal', (req, res) => {
-  const r = loadRequest(req.params.id);
+router.post('/requests/:id/renewal', async (req, res) => {
+  const r = await loadRequest(req.params.id);
   if (r.renewal?.status !== 'pending') fail(409, 'No renewal is awaiting approval');
   const accept = req.body.decision === 'accept';
   const remarks = str(req.body.remarks, 300);
   const t = now();
   if (accept && r.status !== 'issued') fail(409, 'This equipment has already been returned');
-  db.transaction(() => {
-    db.prepare('UPDATE requests SET renew_status = ?, renew_by = ?, renew_at = ?, renew_remarks = ?, updated_at = ? WHERE id = ?').run(
-      accept ? 'approved' : 'rejected', req.user.id, t, remarks || null, t, r.id
-    );
+  await db.tx(async (tx) => {
+    await tx.run('UPDATE requests SET renew_status = ?, renew_by = ?, renew_at = ?, renew_remarks = ?, updated_at = ? WHERE id = ?', [
+      accept ? 'approved' : 'rejected', req.user.id, t, remarks || null, t, r.id,
+    ]);
     if (accept) {
-      db.prepare('UPDATE requests SET to_at = ?, due_soon_alerted_at = NULL, overdue_alerted_at = NULL, alert_dismissed_at = NULL WHERE id = ?').run(r.renewal.to, r.id);
+      await tx.run('UPDATE requests SET to_at = ?, due_soon_alerted_at = NULL, overdue_alerted_at = NULL, alert_dismissed_at = NULL WHERE id = ?', [r.renewal.to, r.id]);
     }
-  })();
-  addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: accept ? 'Renewal approved' : 'Renewal rejected', approvedBy: req.user.name, status: 'IN USE', details: accept ? `New due ${fmtDateTime(r.renewal.to)}` : remarks });
-  notifyUser(r.user.id, accept
+  });
+  await addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: accept ? 'Renewal approved' : 'Renewal rejected', approvedBy: req.user.name, status: 'IN USE', details: accept ? `New due ${fmtDateTime(r.renewal.to)}` : remarks });
+  await notifyUser(r.user.id, accept
     ? { title: `Renewal approved for ${r.code}`, body: `Return by ${fmtDateTime(r.renewal.to)}.${remarks ? `\nRemarks: ${remarks}` : ''}`, link: `/requests/${r.id}` }
     : { title: `Renewal rejected for ${r.code}`, body: `Please return the equipment by ${fmtDateTime(r.toAt)}.${remarks ? `\nRemarks: ${remarks}` : ''}`, link: `/requests/${r.id}` });
-  res.json({ request: S.getRequest(r.id) });
+  res.json({ request: await S.getRequest(r.id) });
 });
 
-router.post('/requests/:id/cancel', (req, res) => {
-  const r = loadRequest(req.params.id);
+router.post('/requests/:id/cancel', async (req, res) => {
+  const r = await loadRequest(req.params.id);
   if (!['pending_l1', 'pending_l2', 'approved'].includes(r.status)) fail(409, 'Only requests that have not been issued can be cancelled');
   const remarks = str(req.body.remarks, 300);
   if (remarks.length < 3) fail(400, 'Give a reason for cancelling', { field: 'remarks' });
-  db.prepare("UPDATE requests SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?").run(now(), now(), r.id);
-  addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Cancelled by admin', approvedBy: approvedBy(r), status: 'CANCELLED', details: remarks });
-  notifyUser(r.user.id, { title: `${r.code} was cancelled`, body: `Cancelled by ${req.user.name}.\nReason: ${remarks}`, link: `/requests/${r.id}` });
-  res.json({ request: S.getRequest(r.id) });
+  await db.run("UPDATE requests SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?", [now(), now(), r.id]);
+  await addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Cancelled by admin', approvedBy: approvedBy(r), status: 'CANCELLED', details: remarks });
+  await notifyUser(r.user.id, { title: `${r.code} was cancelled`, body: `Cancelled by ${req.user.name}.\nReason: ${remarks}`, link: `/requests/${r.id}` });
+  res.json({ request: await S.getRequest(r.id) });
 });
 
 // ---------------- Issue (barcode) ----------------
 
-router.get('/issue-queue', (req, res) => {
-  const requests = S.listRequests("r.status = 'approved'", [], 'r.from_at ASC');
+router.get('/issue-queue', async (req, res) => {
+  const requests = await S.listRequests("r.status = 'approved'", [], 'r.from_at ASC');
   const eqIds = [...new Set(requests.flatMap((r) => r.items.map((i) => i.equipmentId)))];
   const availableUnits = {};
-  for (const id of eqIds) {
-    availableUnits[id] = db.prepare("SELECT barcode FROM units WHERE equipment_id = ? AND status = 'available' ORDER BY barcode").all(id).map((u) => u.barcode);
+  if (eqIds.length) {
+    const rows = await db.all("SELECT equipment_id, barcode FROM units WHERE equipment_id = ANY(?) AND status = 'available' ORDER BY barcode", [eqIds]);
+    for (const id of eqIds) availableUnits[id] = [];
+    for (const u of rows) availableUnits[u.equipment_id].push(u.barcode);
   }
   res.json({ requests, availableUnits });
 });
 
-router.post('/requests/:id/issue', (req, res) => {
-  const r = loadRequest(req.params.id);
+router.post('/requests/:id/issue', async (req, res) => {
+  const r = await loadRequest(req.params.id);
   if (r.status !== 'approved') fail(409, 'Only fully approved requests can be issued');
   const assignments = new Map((Array.isArray(req.body.assignments) ? req.body.assignments : []).map((a) => [Number(a.itemId), str(a.barcode, 40).toUpperCase()]));
   const used = new Set();
-  const plan = r.items.map((item) => {
+  const plan = [];
+  for (const item of r.items) {
     const barcode = assignments.get(item.id);
     if (!barcode) fail(400, `Scan a barcode for ${item.name}`, { itemId: item.id });
     if (used.has(barcode)) fail(400, `Barcode ${barcode} was scanned twice`, { itemId: item.id });
     used.add(barcode);
-    const unit = db.prepare('SELECT * FROM units WHERE barcode = ?').get(barcode);
+    const unit = await db.get('SELECT * FROM units WHERE barcode = ?', [barcode]);
     if (!unit) fail(400, `Barcode ${barcode} is not in the inventory`, { itemId: item.id });
     if (unit.equipment_id !== item.equipmentId) fail(400, `${barcode} is not a ${item.name}`, { itemId: item.id });
     if (unit.status !== 'available') fail(409, `${barcode} is not available (${unit.status.replace('_', ' ')})`, { itemId: item.id });
-    return { item, unit };
-  });
+    plan.push({ item, unit });
+  }
   const t = now();
-  db.transaction(() => {
+  await db.tx(async (tx) => {
     for (const { item, unit } of plan) {
-      db.prepare("UPDATE units SET status = 'in_use' WHERE id = ?").run(unit.id);
-      db.prepare('UPDATE request_items SET unit_id = ? WHERE id = ?').run(unit.id, item.id);
+      const done = await tx.run("UPDATE units SET status = 'in_use' WHERE id = ? AND status = 'available'", [unit.id]);
+      if (!done.changes) fail(409, `${unit.barcode} was just issued elsewhere`, { itemId: item.id });
+      await tx.run('UPDATE request_items SET unit_id = ? WHERE id = ?', [unit.id, item.id]);
     }
-    db.prepare("UPDATE requests SET status = 'issued', issued_by = ?, issued_at = ?, updated_at = ? WHERE id = ?").run(req.user.id, t, t, r.id);
-  })();
-  const updated = S.getRequest(r.id);
-  addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Issued (barcode)', approvedBy: approvedBy(r), status: 'IN USE', details: updated.items.map((i) => i.barcode).join(', ') });
-  notifyUser(r.user.id, { title: `${r.code} issued to you`, body: `${updated.items.map((i) => `${i.name} (${i.barcode})`).join('\n')}\n\nReturn by ${fmtDateTime(r.toAt)}. Handle with care - damage may result in a fine.`, link: `/requests/${r.id}` });
+    const done = await tx.run("UPDATE requests SET status = 'issued', issued_by = ?, issued_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'", [req.user.id, t, t, r.id]);
+    if (!done.changes) fail(409, 'This request was already issued');
+  });
+  const updated = await S.getRequest(r.id);
+  await addLog({ actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '), action: 'Issued (barcode)', approvedBy: approvedBy(r), status: 'IN USE', details: updated.items.map((i) => i.barcode).join(', ') });
+  await notifyUser(r.user.id, { title: `${r.code} issued to you`, body: `${updated.items.map((i) => `${i.name} (${i.barcode})`).join('\n')}\n\nReturn by ${fmtDateTime(r.toAt)}. Handle with care - damage may result in a fine.`, link: `/requests/${r.id}` });
   res.json({ request: updated });
 });
 
 // ---------------- Returns ----------------
 
-router.get('/returns', (req, res) => {
-  res.json({ requests: S.listRequests("r.status = 'issued'", [], 'r.to_at ASC') });
+router.get('/returns', async (req, res) => {
+  res.json({ requests: await S.listRequests("r.status = 'issued'", [], 'r.to_at ASC') });
 });
 
-router.post('/requests/:id/return', (req, res) => {
-  const r = loadRequest(req.params.id);
+router.post('/requests/:id/return', async (req, res) => {
+  const r = await loadRequest(req.params.id);
   if (r.status !== 'issued') fail(409, 'This request is not currently issued');
   const damage = req.body.damage === true;
   const notes = str(req.body.notes, 1000);
@@ -201,58 +223,63 @@ router.post('/requests/:id/return', (req, res) => {
   }
 
   const t = now();
-  const touched = [];
-  db.transaction(() => {
+  await db.tx(async (tx) => {
+    const done = await tx.run(
+      `UPDATE requests SET status = 'returned', returned_at = ?, return_verified_by = ?, return_notes = ?, damage_reported = ?,
+         renew_status = CASE WHEN renew_status = 'pending' THEN 'rejected' ELSE renew_status END, updated_at = ?
+       WHERE id = ? AND status = 'issued'`,
+      [t, req.user.id, notes || null, damage ? 1 : 0, t, r.id]
+    );
+    if (!done.changes) fail(409, 'This return was already verified');
     for (const item of r.items) {
       const ok = okIds.has(item.id);
-      db.prepare('UPDATE request_items SET return_ok = ?, damaged = ? WHERE id = ?').run(ok ? 1 : 0, ok ? 0 : 1, item.id);
-      const unit = db.prepare('SELECT u.id FROM units u JOIN request_items ri ON ri.unit_id = u.id WHERE ri.id = ?').get(item.id);
-      if (unit) {
-        if (ok) db.prepare("UPDATE units SET status = 'available' WHERE id = ?").run(unit.id);
-        else db.prepare("UPDATE units SET status = 'maintenance', notes = ? WHERE id = ?").run(`${r.code}: ${notes}`.slice(0, 500), unit.id);
+      const row = await tx.get('UPDATE request_items SET return_ok = ?, damaged = ? WHERE id = ? RETURNING unit_id', [ok ? 1 : 0, ok ? 0 : 1, item.id]);
+      if (row?.unit_id) {
+        if (ok) await tx.run("UPDATE units SET status = 'available' WHERE id = ?", [row.unit_id]);
+        else await tx.run("UPDATE units SET status = 'maintenance', notes = ? WHERE id = ?", [`${r.code}: ${notes}`.slice(0, 500), row.unit_id]);
       }
-      touched.push(item.equipmentId);
     }
-    db.prepare("UPDATE requests SET status = 'returned', returned_at = ?, return_verified_by = ?, return_notes = ?, damage_reported = ?, renew_status = CASE WHEN renew_status = 'pending' THEN 'rejected' ELSE renew_status END, updated_at = ? WHERE id = ?")
-      .run(t, req.user.id, notes || null, damage ? 1 : 0, t, r.id);
-  })();
+  });
 
-  const updated = S.getRequest(r.id);
+  const updated = await S.getRequest(r.id);
   const late = r.toAt < t;
-  addLog({
+  await addLog({
     actorId: req.user.id, subjectUserId: r.user.id, requestId: r.id, equipment: r.equipmentList.join(', '),
     action: damage ? 'Returned (damage reported)' : late ? 'Returned (OK, late)' : 'Returned (OK)',
     approvedBy: approvedBy(r), status: damage ? 'DAMAGED' : 'CLOSED', details: notes,
   });
-  notifyUser(r.user.id, damage
+  await notifyUser(r.user.id, damage
     ? { title: `Return of ${r.code} recorded with damage`, body: `${req.user.name} verified the return and reported an issue:\n${notes}\n\nThe Media Lab will contact you about the damage policy.`, link: `/requests/${r.id}` }
     : { title: `Return verified for ${r.code}`, body: `${req.user.name} confirmed the return checklist. Thank you for handling the equipment with care.`, link: `/requests/${r.id}` });
-  S.processNotifyRequests(touched);
+  await S.processNotifyRequests(r.items.map((i) => i.equipmentId));
   res.json({ request: updated });
 });
 
 // ---------------- Inventory ----------------
 
-function inventoryItem(e) {
-  const units = db.prepare('SELECT * FROM units WHERE equipment_id = ? ORDER BY barcode').all(e.id);
-  const accessoryIds = db.prepare('SELECT accessory_id FROM accessory_links WHERE equipment_id = ?').all(e.id).map((a) => a.accessory_id);
-  return {
+async function inventoryItems(equipment) {
+  if (!equipment.length) return [];
+  const ids = equipment.map((e) => e.id);
+  const units = await db.all('SELECT * FROM units WHERE equipment_id = ANY(?) ORDER BY barcode', [ids]);
+  const links = await db.all('SELECT * FROM accessory_links WHERE equipment_id = ANY(?)', [ids]);
+  return equipment.map((e) => ({
     ...e,
-    accessoryIds,
-    units: units.map((u) => ({ id: u.id, barcode: u.barcode, status: u.status, notes: u.notes })),
-  };
+    accessoryIds: links.filter((l) => l.equipment_id === e.id).map((l) => l.accessory_id),
+    units: units.filter((u) => u.equipment_id === e.id).map((u) => ({ id: u.id, barcode: u.barcode, status: u.status, notes: u.notes })),
+  }));
 }
+const inventoryItem = async (e) => (await inventoryItems([e]))[0];
 
-router.get('/inventory', (req, res) => {
+router.get('/inventory', async (req, res) => {
   const category = S.CATEGORIES.includes(req.query.category) ? req.query.category : null;
-  const equipment = S.listEquipment({ category, q: str(req.query.q, 80) || null, includeInactive: true }).map(inventoryItem);
-  res.json({ equipment });
+  const equipment = await S.listEquipment({ category, q: str(req.query.q, 80) || null, includeInactive: true });
+  res.json({ equipment: await inventoryItems(equipment) });
 });
 
-router.get('/inventory/:id', (req, res) => {
-  const e = S.getEquipment(intId(req.params.id));
+router.get('/inventory/:id', async (req, res) => {
+  const e = await S.getEquipment(intId(req.params.id));
   if (!e) fail(404, 'Equipment not found');
-  res.json({ equipment: inventoryItem(e) });
+  res.json({ equipment: await inventoryItem(e) });
 });
 
 function validateEquipmentBody(b, partial = false) {
@@ -272,81 +299,87 @@ function validateEquipmentBody(b, partial = false) {
   return out;
 }
 
-function setAccessories(equipmentId, ids) {
+async function setAccessories(tx, equipmentId, ids) {
   if (!Array.isArray(ids)) return;
-  db.prepare('DELETE FROM accessory_links WHERE equipment_id = ?').run(equipmentId);
-  const ins = db.prepare('INSERT OR IGNORE INTO accessory_links (equipment_id, accessory_id) VALUES (?, ?)');
-  for (const raw of ids) {
-    const id = Number(raw);
-    if (Number.isInteger(id) && id !== equipmentId && db.prepare('SELECT 1 FROM equipment WHERE id = ?').get(id)) ins.run(equipmentId, id);
-  }
+  await tx.run('DELETE FROM accessory_links WHERE equipment_id = ?', [equipmentId]);
+  const clean = [...new Set(ids.map(Number))].filter((id) => Number.isInteger(id) && id !== equipmentId);
+  if (!clean.length) return;
+  await tx.run(
+    `INSERT INTO accessory_links (equipment_id, accessory_id)
+     SELECT ?, id FROM equipment WHERE id = ANY(?) ON CONFLICT DO NOTHING`,
+    [equipmentId, clean]
+  );
 }
 
-function addUnits(equipmentId, code, count) {
-  const existing = db.prepare('SELECT barcode FROM units WHERE equipment_id = ?').all(equipmentId).map((u) => u.barcode);
-  let n = existing.reduce((m, b) => Math.max(m, Number(b.split('-').pop()) || 0), 0);
-  const ins = db.prepare("INSERT INTO units (equipment_id, barcode, status, created_at) VALUES (?, ?, 'available', ?)");
+async function addUnits(tx, equipmentId, code, count) {
+  const existing = new Set((await tx.all('SELECT barcode FROM units WHERE barcode LIKE ?', [`${code}-%`])).map((u) => u.barcode));
+  let n = [...existing].reduce((m, b) => Math.max(m, Number(b.split('-').pop()) || 0), 0);
   const created = [];
   for (let i = 0; i < count; i++) {
     let barcode;
     do {
       n += 1;
       barcode = `${code}-${String(n).padStart(2, '0')}`;
-    } while (db.prepare('SELECT 1 FROM units WHERE barcode = ?').get(barcode));
-    ins.run(equipmentId, barcode, now());
+    } while (existing.has(barcode));
     created.push(barcode);
+  }
+  if (created.length) {
+    await tx.run(
+      "INSERT INTO units (equipment_id, barcode, status, created_at) SELECT ?, unnest(?::text[]), 'available', ?",
+      [equipmentId, created, now()]
+    );
   }
   return created;
 }
 
-router.post('/equipment', (req, res) => {
+router.post('/equipment', async (req, res) => {
   const b = req.body;
   const data = validateEquipmentBody(b);
   const code = str(b.code, 20).toUpperCase();
   if (!/^[A-Z0-9][A-Z0-9-]{1,19}$/.test(code)) fail(400, 'Code must be letters, digits and dashes, e.g. CAM-014', { field: 'code' });
-  if (db.prepare('SELECT 1 FROM equipment WHERE code = ?').get(code)) fail(409, `Code ${code} is already used`, { field: 'code' });
+  if (await db.get('SELECT 1 FROM equipment WHERE code = ?', [code])) fail(409, `Code ${code} is already used`, { field: 'code' });
   const qty = Number(b.quantity ?? 1);
   if (!Number.isInteger(qty) || qty < 0 || qty > 200) fail(400, 'Quantity must be between 0 and 200', { field: 'quantity' });
 
-  const id = db.transaction(() => {
-    const eid = Number(
-      db.prepare('INSERT INTO equipment (name, category, subtype, code, description, is_accessory, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(data.name, data.category, data.subtype || '', code, data.description || '', data.is_accessory || 0, now()).lastInsertRowid
+  const id = await db.tx(async (tx) => {
+    const { id: eid } = await tx.get(
+      'INSERT INTO equipment (name, category, subtype, code, description, is_accessory, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id',
+      [data.name, data.category, data.subtype || '', code, data.description || '', data.is_accessory || 0, now()]
     );
-    addUnits(eid, code, qty);
-    setAccessories(eid, b.accessoryIds);
+    await addUnits(tx, eid, code, qty);
+    await setAccessories(tx, eid, b.accessoryIds);
     return eid;
-  })();
-  addLog({ actorId: req.user.id, equipment: data.name, action: 'Equipment added', details: `${code} x${qty}` });
-  res.status(201).json({ equipment: inventoryItem(S.getEquipment(id)) });
+  });
+  await addLog({ actorId: req.user.id, equipment: data.name, action: 'Equipment added', details: `${code} x${qty}` });
+  res.status(201).json({ equipment: await inventoryItem(await S.getEquipment(id)) });
 });
 
-router.patch('/equipment/:id', (req, res) => {
-  const e = S.getEquipment(intId(req.params.id));
+router.patch('/equipment/:id', async (req, res) => {
+  const e = await S.getEquipment(intId(req.params.id));
   if (!e) fail(404, 'Equipment not found');
   const data = validateEquipmentBody(req.body, true);
-  db.transaction(() => {
+  await db.tx(async (tx) => {
     const keys = Object.keys(data);
-    if (keys.length) db.prepare(`UPDATE equipment SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map((k) => data[k]), e.id);
-    setAccessories(e.id, req.body.accessoryIds);
-  })();
-  addLog({ actorId: req.user.id, equipment: data.name || e.name, action: 'Equipment updated' });
-  res.json({ equipment: inventoryItem(S.getEquipment(e.id)) });
+    if (keys.length) await tx.run(`UPDATE equipment SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, [...keys.map((k) => data[k]), e.id]);
+    await setAccessories(tx, e.id, req.body.accessoryIds);
+  });
+  await addLog({ actorId: req.user.id, equipment: data.name || e.name, action: 'Equipment updated' });
+  res.json({ equipment: await inventoryItem(await S.getEquipment(e.id)) });
 });
 
-router.post('/equipment/:id/units', (req, res) => {
-  const e = S.getEquipment(intId(req.params.id));
+router.post('/equipment/:id/units', async (req, res) => {
+  const e = await S.getEquipment(intId(req.params.id));
   if (!e) fail(404, 'Equipment not found');
   const count = Number(req.body.count);
   if (!Number.isInteger(count) || count < 1 || count > 100) fail(400, 'Add between 1 and 100 units');
-  const created = db.transaction(() => addUnits(e.id, e.code, count))();
-  addLog({ actorId: req.user.id, equipment: e.name, action: 'Units added', details: created.join(', ') });
-  S.processNotifyRequests([e.id]);
-  res.json({ equipment: inventoryItem(S.getEquipment(e.id)), created });
+  const created = await db.tx((tx) => addUnits(tx, e.id, e.code, count));
+  await addLog({ actorId: req.user.id, equipment: e.name, action: 'Units added', details: created.join(', ') });
+  await S.processNotifyRequests([e.id]);
+  res.json({ equipment: await inventoryItem(await S.getEquipment(e.id)), created });
 });
 
-router.patch('/units/:id', (req, res) => {
-  const unit = db.prepare('SELECT u.*, e.name FROM units u JOIN equipment e ON e.id = u.equipment_id WHERE u.id = ?').get(intId(req.params.id));
+router.patch('/units/:id', async (req, res) => {
+  const unit = await db.get('SELECT u.*, e.name FROM units u JOIN equipment e ON e.id = u.equipment_id WHERE u.id = ?', [intId(req.params.id)]);
   if (!unit) fail(404, 'Unit not found');
   const status = req.body.status;
   if (status !== undefined) {
@@ -354,25 +387,26 @@ router.patch('/units/:id', (req, res) => {
     if (unit.status === 'in_use') fail(409, 'This unit is issued. Verify its return first.');
   }
   const notes = req.body.notes !== undefined ? str(req.body.notes, 500) : unit.notes;
-  db.prepare('UPDATE units SET status = ?, notes = ? WHERE id = ?').run(status ?? unit.status, notes, unit.id);
+  await db.run('UPDATE units SET status = ?, notes = ? WHERE id = ?', [status ?? unit.status, notes, unit.id]);
   if (status && status !== unit.status) {
-    addLog({ actorId: req.user.id, equipment: `${unit.name} (${unit.barcode})`, action: `Unit marked ${status}`, status: status.toUpperCase(), details: notes });
-    if (status === 'available') S.processNotifyRequests([unit.equipment_id]);
+    await addLog({ actorId: req.user.id, equipment: `${unit.name} (${unit.barcode})`, action: `Unit marked ${status}`, status: status.toUpperCase(), details: notes });
+    if (status === 'available') await S.processNotifyRequests([unit.equipment_id]);
   }
   res.json({ ok: true });
 });
 
-router.get('/units/lookup', (req, res) => {
+router.get('/units/lookup', async (req, res) => {
   const barcode = str(req.query.barcode, 40).toUpperCase();
-  const unit = db.prepare('SELECT * FROM units WHERE barcode = ?').get(barcode);
+  const unit = await db.get('SELECT * FROM units WHERE barcode = ?', [barcode]);
   if (!unit) fail(404, `No item with barcode ${barcode}`);
-  const holder = db
-    .prepare("SELECT ri.request_id FROM request_items ri JOIN requests r ON r.id = ri.request_id WHERE ri.unit_id = ? AND r.status = 'issued'")
-    .get(unit.id);
+  const holder = await db.get(
+    "SELECT ri.request_id FROM request_items ri JOIN requests r ON r.id = ri.request_id WHERE ri.unit_id = ? AND r.status = 'issued'",
+    [unit.id]
+  );
   res.json({
     unit: { id: unit.id, barcode: unit.barcode, status: unit.status, notes: unit.notes },
-    equipment: S.getEquipment(unit.equipment_id),
-    request: holder ? S.getRequest(holder.request_id) : null,
+    equipment: await S.getEquipment(unit.equipment_id),
+    request: holder ? await S.getRequest(holder.request_id) : null,
   });
 });
 
@@ -395,7 +429,7 @@ function fmtLog(l) {
   };
 }
 
-function queryLogs(q) {
+async function queryLogs(q) {
   const where = [];
   const p = [];
   if (q.type === 'student') where.push("su.profession = 'student'");
@@ -410,25 +444,24 @@ function queryLogs(q) {
   if (to) { where.push('l.at <= ?'); p.push(to.toISOString()); }
   const search = str(q.q, 80);
   if (search) {
-    where.push('(su.name LIKE ? OR l.equipment LIKE ? OR l.action LIKE ? OR rq.code LIKE ?)');
+    where.push('(su.name ILIKE ? OR l.equipment ILIKE ? OR l.action ILIKE ? OR rq.code ILIKE ?)');
     p.push(...Array(4).fill(`%${search}%`));
   }
-  return db
-    .prepare(
-      `SELECT l.*, su.name AS user_name, su.profession AS user_profession, ac.name AS actor_name, rq.code AS request_code
-       FROM logs l
-       LEFT JOIN users su ON su.id = l.subject_user_id
-       LEFT JOIN users ac ON ac.id = l.actor_id
-       LEFT JOIN requests rq ON rq.id = l.request_id
-       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-       ORDER BY l.at DESC LIMIT 2000`
-    )
-    .all(...p)
-    .map(fmtLog);
+  const rows = await db.all(
+    `SELECT l.*, su.name AS user_name, su.profession AS user_profession, ac.name AS actor_name, rq.code AS request_code
+     FROM logs l
+     LEFT JOIN users su ON su.id = l.subject_user_id
+     LEFT JOIN users ac ON ac.id = l.actor_id
+     LEFT JOIN requests rq ON rq.id = l.request_id
+     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+     ORDER BY l.at DESC, l.id DESC LIMIT 2000`,
+    p
+  );
+  return rows.map(fmtLog);
 }
 
-router.get('/logs', (req, res) => {
-  const logs = queryLogs(req.query);
+router.get('/logs', async (req, res) => {
+  const logs = await queryLogs(req.query);
   if (req.query.format === 'csv') {
     const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const rows = [['Date', 'Request', 'User', 'Equipment', 'Action', 'Approved by', 'Status', 'Recorded by', 'Details']];
@@ -442,22 +475,21 @@ router.get('/logs', (req, res) => {
 
 // ---------------- Users ----------------
 
-router.get('/users', (req, res) => {
+router.get('/users', async (req, res) => {
   const where = [];
   const p = [];
   const q = str(req.query.q, 80);
   if (q) {
-    where.push('(name LIKE ? OR email LIKE ? OR department LIKE ?)');
+    where.push('(name ILIKE ? OR email ILIKE ? OR department ILIKE ?)');
     p.push(`%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (req.query.type === 'student') where.push("profession = 'student' AND role = 'user'");
   else if (req.query.type === 'staff') where.push("profession IN ('faculty', 'staff') AND role = 'user'");
-  const users = db
-    .prepare(
-      `SELECT u.*, (SELECT COUNT(*) FROM requests r WHERE r.user_id = u.id AND r.status <> 'draft') AS request_count
-       FROM users u ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.role DESC, u.name COLLATE NOCASE LIMIT 1000`
-    )
-    .all(...p);
+  const users = await db.all(
+    `SELECT u.*, (SELECT COUNT(*) FROM requests r WHERE r.user_id = u.id AND r.status <> 'draft') AS request_count
+     FROM users u ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.role DESC, lower(u.name) LIMIT 1000`,
+    p
+  );
   res.json({
     users: users.map((u) => ({
       id: u.id, name: u.name, email: u.email, phone: u.phone, profession: u.profession, batch: u.batch,
@@ -467,10 +499,10 @@ router.get('/users', (req, res) => {
   });
 });
 
-router.patch('/users/:id', (req, res) => {
+router.patch('/users/:id', async (req, res) => {
   requireLevel2(req);
   const id = intId(req.params.id);
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
   if (!u) fail(404, 'User not found');
   if (id === req.user.id) fail(400, 'You cannot change your own access');
   let role = u.role;
@@ -482,9 +514,9 @@ router.patch('/users/:id', (req, res) => {
     [role, level] = map[req.body.access];
   }
   if (req.body.active !== undefined) active = req.body.active ? 1 : 0;
-  db.prepare('UPDATE users SET role = ?, approval_level = ?, active = ? WHERE id = ?').run(role, level, active, id);
-  if (!active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
-  addLog({ actorId: req.user.id, subjectUserId: id, action: 'Access changed', details: `${role}${level ? ` L${level}` : ''}${active ? '' : ', disabled'}` });
+  await db.run('UPDATE users SET role = ?, approval_level = ?, active = ? WHERE id = ?', [role, level, active, id]);
+  if (!active) await db.run('DELETE FROM sessions WHERE user_id = ?', [id]);
+  await addLog({ actorId: req.user.id, subjectUserId: id, action: 'Access changed', details: `${role}${level ? ` L${level}` : ''}${active ? '' : ', disabled'}` });
   res.json({ ok: true });
 });
 
