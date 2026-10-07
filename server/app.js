@@ -56,7 +56,7 @@ app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['htm
 app.use((err, req, res, next) => {
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...(err.extra || {}) });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON' });
-  console.error(err);
+  console.error('[api]', req.method, req.originalUrl, err);
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 

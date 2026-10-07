@@ -1,12 +1,9 @@
 // Postgres (Supabase) access. Queries use `?` placeholders, converted to $1, $2 … here.
 const { Pool, types } = require('pg');
 const config = require('./config');
+const { HttpError } = require('./util');
 
 types.setTypeParser(20, (v) => parseInt(v, 10)); // COUNT(*) returns bigint
-
-if (!config.databaseUrl) {
-  throw new Error('DATABASE_URL is not set. Add your Supabase connection string to .env (see .env.example).');
-}
 
 function poolConfig(url) {
   const u = new URL(url);
@@ -22,7 +19,9 @@ function poolConfig(url) {
   };
 }
 
-const pool = new Pool(poolConfig(config.databaseUrl));
+const MISSING_DB = 'Database is not configured: set DATABASE_URL (or connect Supabase in Vercel > Storage) and redeploy.';
+if (!config.databaseUrl) console.error(MISSING_DB);
+const pool = new Pool(config.databaseUrl ? poolConfig(config.databaseUrl) : {});
 pool.on('error', (e) => console.error('[db] idle client error:', e.message));
 
 const toPg = (sql) => {
@@ -212,6 +211,7 @@ const now = () => new Date().toISOString();
 // Creates tables (and seeds on first run) once per process / serverless instance.
 let readyPromise = null;
 function ensureReady() {
+  if (!config.databaseUrl) return Promise.reject(new HttpError(503, MISSING_DB));
   if (!readyPromise) {
     readyPromise = (async () => {
       const current = await pool.query("SELECT value FROM meta WHERE key = 'schema_version'").then((r) => r.rows[0]?.value, () => null);
