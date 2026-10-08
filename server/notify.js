@@ -47,7 +47,7 @@ async function sendEmail(to, subject, text, link) {
     return { ok: true };
   } catch (e) {
     console.error('[email] failed:', e.message);
-    return { ok: false, error: e.message };
+    return { ok: false, error: e.message, code: [e.code, e.responseCode].filter(Boolean).join(' ') || 'UNKNOWN' };
   }
 }
 

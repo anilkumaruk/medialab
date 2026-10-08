@@ -99,7 +99,7 @@ router.post('/otp', async (req, res) => {
     const text = `Your MediaLab ${purpose === 'reset' ? 'password reset' : 'verification'} code is ${code}. It expires in 10 minutes.`;
     if (channel === 'email') {
       const sent = await sendEmail(target, 'Your MediaLab verification code', text);
-      if (!sent.ok) fail(502, 'We could not send the email right now. Please try again shortly or contact the Media Lab.');
+      if (!sent.ok) fail(502, `We could not send the email right now (error ${sent.code}). Please try again shortly or contact the Media Lab.`);
     }
     else await sendSms(target, text);
   }
