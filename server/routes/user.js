@@ -139,12 +139,21 @@ router.post('/requests', async (req, res) => {
   const r = await S.getRequest(id);
   if (submit) {
     await addLog({ actorId: req.user.id, subjectUserId: req.user.id, requestId: id, equipment: r.equipmentList.join(', '), action: 'Requested', status: 'PENDING L1' });
-    await notifyAdmins({
-      level: 1,
-      title: `New equipment request ${r.code} from ${r.user.name}`,
-      body: `${S.requestDetailsText(r)}\n\nPlease accept or reject this request (remarks are compulsory at Level 1).`,
-      link: `/admin/approvals/${id}`,
-    });
+    const l1Names = (await S.approverNames(1)).join(' / ');
+    await Promise.all([
+      notifyAdmins({
+        level: 1,
+        title: `New equipment request ${r.code} from ${r.user.name}`,
+        body: `${S.requestDetailsText(r)}\n\nPlease accept or reject this request (remarks are compulsory at Level 1).`,
+        link: `/admin/approvals/${id}`,
+      }),
+      notifyAdmins({
+        level: 2,
+        title: `New equipment request ${r.code} from ${r.user.name} (for your information)`,
+        body: `${S.requestDetailsText(r)}\n\nThis request is now with Level 1 (${l1Names}). You will get another email when it is ready for your final approval.`,
+        link: `/admin/approvals/${id}?all=1`,
+      }),
+    ]);
   }
   res.status(existing ? 200 : 201).json({ request: r });
 });

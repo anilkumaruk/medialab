@@ -98,7 +98,7 @@ async function notifyAdmins({ level = null, ...msg }) {
   const rows = level
     ? await db.all("SELECT id FROM users WHERE role = 'admin' AND active = 1 AND approval_level = ?", [level])
     : await db.all("SELECT id FROM users WHERE role = 'admin' AND active = 1");
-  for (const r of rows) await notifyUser(r.id, msg);
+  await Promise.all(rows.map((r) => notifyUser(r.id, msg)));
 }
 
 async function addLog({ actorId = null, subjectUserId = null, requestId = null, equipment = '', action, approvedBy = '', status = '', details = '' }, runner = db) {
