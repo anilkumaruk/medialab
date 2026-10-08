@@ -2,7 +2,7 @@ const express = require('express');
 const { db, now } = require('../db');
 const { fail, str, parseDate, intId, fmtDateTime } = require('../util');
 const { requireAdmin } = require('../auth');
-const { notifyUser, notifyAdmins, addLog } = require('../notify');
+const { notifyUser, notifyAdmins, addLog, sendEmail, emailSettings } = require('../notify');
 const { maybeRunAlerts } = require('../jobs');
 const S = require('../services');
 
@@ -471,6 +471,16 @@ router.get('/logs', async (req, res) => {
     return res.send('﻿' + rows.map((r) => r.map(cell).join(',')).join('\r\n'));
   }
   res.json({ logs });
+});
+
+// ---------------- Email diagnostics ----------------
+
+// Sends a test email to the signed-in admin and reports the exact SMTP result.
+router.post('/test-email', async (req, res) => {
+  const settings = emailSettings();
+  if (!settings.configured) return res.json({ settings, result: { ok: false, error: 'SMTP_HOST is not set, so emails are only written to the server log.' } });
+  const result = await sendEmail(req.user.email, 'MediaLab test email', `This is a test email from MediaLab sent at ${fmtDateTime(now())}. Email delivery is working.`);
+  res.json({ settings, result });
 });
 
 // ---------------- Users ----------------

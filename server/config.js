@@ -33,12 +33,12 @@ module.exports = {
   dueSoonHours: Number(process.env.DUE_SOON_HOURS) || 2,
 
   smtp: {
-    host: process.env.SMTP_HOST || '',
+    host: (process.env.SMTP_HOST || '').trim(),
     port: Number(process.env.SMTP_PORT) || 587,
-    user: process.env.SMTP_USER || '',
-    pass: process.env.SMTP_PASS || '',
+    user: (process.env.SMTP_USER || '').trim(),
+    pass: (process.env.SMTP_PASS || '').replace(/\s+/g, ''), // Gmail app passwords are shown with spaces
   },
-  mailFrom: process.env.MAIL_FROM || 'MediaLab <no-reply@medialab.local>',
+  mailFrom: (process.env.MAIL_FROM || '').trim() || (process.env.SMTP_USER ? `MediaLab <${process.env.SMTP_USER.trim()}>` : 'MediaLab <no-reply@medialab.local>'),
 
   // Phone OTP is only required when an SMS provider is set up (PHONE_OTP=true/false overrides).
   phoneOtpRequired: process.env.PHONE_OTP ? process.env.PHONE_OTP === 'true' : smsConfigured,

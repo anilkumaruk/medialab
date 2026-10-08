@@ -850,7 +850,8 @@ export async function users(view, ctx) {
   let q = '';
   view.innerHTML = `
     ${canEdit ? '' : '<div class="notice blue" style="margin-bottom:16px">Only Level 2 admins can change roles and approval levels.</div>'}
-    <div class="toolbar"><div class="search spacer">${ICONS.search}<input class="input" id="q" placeholder="Search name, email or department"></div></div>
+    <div class="toolbar"><div class="search spacer">${ICONS.search}<input class="input" id="q" placeholder="Search name, email or department"></div>
+      <button class="btn btn-secondary" id="test-email">Send test email</button></div>
     <div class="card"><div id="table"></div></div>`;
   const draw = () => {
     const items = list.filter((u) => !q || `${u.name} ${u.email} ${u.department}`.toLowerCase().includes(q));
@@ -887,6 +888,27 @@ export async function users(view, ctx) {
     q = e.target.value.trim().toLowerCase();
     draw();
   }, 150));
+  view.querySelector('#test-email').addEventListener('click', (e) =>
+    withButton(e.currentTarget, async () => {
+      try {
+        const { settings: s, result: r } = await api('/admin/test-email', { body: {} });
+        modal({
+          title: r.ok ? 'Test email sent' : 'Email failed',
+          body: `<p class="${r.ok ? '' : 'notice red'}" style="margin-bottom:16px">${r.ok ? `Sent to <strong>${esc(ctx.user.email)}</strong>. Check the inbox (and spam).` : esc(r.error)}</p>
+            <dl class="kv">
+              <dt>SMTP_HOST</dt><dd class="mono">${esc(s.host || '(not set)')}</dd>
+              <dt>SMTP_PORT</dt><dd class="mono">${s.port}${s.secure ? ' (SSL)' : ' (STARTTLS)'}</dd>
+              <dt>SMTP_USER</dt><dd class="mono">${esc(s.user || '(not set)')}</dd>
+              <dt>SMTP_PASS</dt><dd class="mono">${s.passwordSet ? `set, ${s.passwordLength} characters` : '(not set)'}</dd>
+              <dt>From</dt><dd class="mono">${esc(s.from)}</dd>
+            </dl>`,
+          footer: '<button class="btn btn-primary" data-close>Close</button>',
+        });
+      } catch (err) {
+        toastError(err);
+      }
+    })
+  );
   view.querySelector('#table').addEventListener('change', (e) => {
     if (e.target.matches('[data-access]')) save(Number(e.target.closest('[data-user]').dataset.user), { access: e.target.value });
   });

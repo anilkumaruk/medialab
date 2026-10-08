@@ -9,6 +9,9 @@ if (config.smtp.host) {
     port: config.smtp.port,
     secure: config.smtp.port === 465,
     auth: config.smtp.user ? { user: config.smtp.user, pass: config.smtp.pass } : undefined,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
   });
 }
 
@@ -26,11 +29,12 @@ function emailHtml(title, text, link) {
   </div></div>`;
 }
 
+// Resolves to { ok: true } or { ok: false, error } - never throws.
 async function sendEmail(to, subject, text, link) {
-  if (!to) return;
+  if (!to) return { ok: false, error: 'No recipient' };
   if (!transporter) {
     console.log(`\n[email -> ${to}] ${subject}\n${text}${link ? `\n${link}` : ''}\n`);
-    return;
+    return { ok: true, logged: true };
   }
   try {
     await transporter.sendMail({
@@ -40,9 +44,24 @@ async function sendEmail(to, subject, text, link) {
       text: link ? `${text}\n\n${link}` : text,
       html: emailHtml(subject, text, link),
     });
+    return { ok: true };
   } catch (e) {
     console.error('[email] failed:', e.message);
+    return { ok: false, error: e.message };
   }
+}
+
+function emailSettings() {
+  return {
+    configured: !!transporter,
+    host: config.smtp.host || null,
+    port: config.smtp.port,
+    secure: config.smtp.port === 465,
+    user: config.smtp.user || null,
+    passwordSet: !!config.smtp.pass,
+    passwordLength: config.smtp.pass.length,
+    from: config.mailFrom,
+  };
 }
 
 async function sendSms(to, text) {
@@ -90,4 +109,4 @@ async function addLog({ actorId = null, subjectUserId = null, requestId = null, 
   );
 }
 
-module.exports = { sendEmail, sendSms, notifyUser, notifyAdmins, addLog };
+module.exports = { sendEmail, sendSms, notifyUser, notifyAdmins, addLog, emailSettings };
