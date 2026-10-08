@@ -19,6 +19,7 @@ router.get('/config', (req, res) => {
   res.json({
     allowedDomains: config.allowedDomains,
     devMode: config.devShowOtp,
+    phoneOtp: config.phoneOtpRequired,
     maxRequestDays: config.maxRequestDays,
   });
 });
@@ -150,17 +151,17 @@ router.post('/register', async (req, res) => {
   if (await db.get('SELECT 1 FROM users WHERE email = ?', [email])) fail(409, 'An account with this email already exists', { field: 'email' });
 
   const emailOtpId = await findValidOtp('email', email, 'register', str(b.emailOtp, 6));
-  const phoneOtpId = await findValidOtp('phone', phone, 'register', str(b.phoneOtp, 6));
+  const phoneOtpId = config.phoneOtpRequired ? await findValidOtp('phone', phone, 'register', str(b.phoneOtp, 6)) : null;
 
   const t = now();
   const hash = await bcrypt.hash(password, 10);
   const user = await db.tx(async (tx) => {
-    await consumeOtps(tx, [emailOtpId, phoneOtpId]);
+    await consumeOtps(tx, [emailOtpId, phoneOtpId].filter(Boolean));
     return tx.get(
       `INSERT INTO users (name, email, phone, profession, batch, department, school, password_hash,
          email_verified, phone_verified, terms_accepted_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?) RETURNING *`,
-      [name, email, phone, profession, profession === 'student' ? batch : null, department, school, hash, t, t]
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING *`,
+      [name, email, phone, profession, profession === 'student' ? batch : null, department, school, hash, phoneOtpId ? 1 : 0, t, t]
     );
   });
 

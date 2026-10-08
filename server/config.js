@@ -5,6 +5,8 @@ const port = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 const list = (v) => String(v || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
+const smsConfigured = !!process.env.TWILIO_ACCOUNT_SID;
+
 module.exports = {
   isProd,
   port,
@@ -37,6 +39,9 @@ module.exports = {
     pass: process.env.SMTP_PASS || '',
   },
   mailFrom: process.env.MAIL_FROM || 'MediaLab <no-reply@medialab.local>',
+
+  // Phone OTP is only required when an SMS provider is set up (PHONE_OTP=true/false overrides).
+  phoneOtpRequired: process.env.PHONE_OTP ? process.env.PHONE_OTP === 'true' : smsConfigured,
 
   twilio: {
     sid: process.env.TWILIO_ACCOUNT_SID || '',

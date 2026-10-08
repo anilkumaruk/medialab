@@ -177,16 +177,16 @@ export async function register(view, ctx) {
           <div class="span-2" id="batch-wrap">${field('batch', 'Batch', 'placeholder="2024-2028" maxlength="20"')}</div>
           <div class="span-2">${field('department', 'Department', 'placeholder="CSE" maxlength="80"')}</div>
           <div class="span-2" id="school-wrap">${field('school', 'School', 'placeholder="Advanced Computing" maxlength="120"')}</div>
-          <div class="span-3 field">
+          <div class="${ctx.config.phoneOtp ? 'span-3' : 'span-6'} field">
             <label for="f-emailOtp">Email OTP</label>
             <div class="input-group"><input class="input" id="f-emailOtp" name="emailOtp" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="one-time-code">${otpBtn('email')}</div>
             <div class="field-error"></div>
           </div>
-          <div class="span-3 field">
+          ${ctx.config.phoneOtp ? `<div class="span-3 field">
             <label for="f-phoneOtp">Phone OTP</label>
             <div class="input-group"><input class="input" id="f-phoneOtp" name="phoneOtp" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="one-time-code">${otpBtn('phone')}</div>
             <div class="field-error"></div>
-          </div>
+          </div>` : ''}
           <div class="span-3">${field('password', 'Password', 'type="password" autocomplete="new-password" placeholder="Min 8 characters"')}</div>
           <div class="span-3">${field('confirmPassword', 'Confirm password', 'type="password" autocomplete="new-password" placeholder="Re-enter password"')}</div>
           <div class="span-6 field">
@@ -261,7 +261,7 @@ export async function register(view, ctx) {
       department: f.department.value,
       school: f.school.value,
       emailOtp: f.emailOtp.value.trim(),
-      phoneOtp: f.phoneOtp.value.trim(),
+      phoneOtp: f.phoneOtp?.value.trim() || '',
       password: f.password.value,
       confirmPassword: f.confirmPassword.value,
       acceptTerms: f.acceptTerms.checked,
