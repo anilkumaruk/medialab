@@ -100,7 +100,10 @@ router.post('/otp', async (req, res) => {
     else await sendSms(target, text);
   }
 
-  res.json({ ok: true, resendIn: OTP_RESEND_S, ...(config.devShowOtp && deliver ? { devCode: code } : {}) });
+  // Demo mode may show registration codes, but never password-reset codes:
+  // that would let anyone reset any account's password.
+  const showCode = config.devShowOtp && deliver && purpose === 'register';
+  res.json({ ok: true, resendIn: OTP_RESEND_S, ...(showCode ? { devCode: code } : {}) });
 });
 
 async function findValidOtp(channel, target, purpose, code) {
